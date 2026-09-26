@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from urllib import request as urlrequest
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
 
 app = FastAPI(title="Vera 2.0")
 START = time.time()
@@ -39,31 +39,78 @@ def _provider():
 LLM_BASE, LLM_MODEL = _provider()
 
 
-def llm_json(system: str, user: str, timeout: float = 20.0):
-    """Call an OpenAI-compatible chat endpoint, return parsed JSON dict or None."""
-    if not LLM_API_KEY:
-        return None
+import threading
+from urllib.error import HTTPError
+
+LLM_SLOTS = threading.Semaphore(int(os.environ.get("LLM_CONCURRENCY", "3")))
+LLM_MODEL_2 = os.environ.get("LLM_MODEL_2") or ("llama-3.1-8b-instant" if LLM_BASE.startswith("https://api.groq.com") else "")
+LLM_STATS = {"ok": 0, "fail": 0, "last_error": None}
+
+
+def _chat(model, system, user, timeout):
     body = {
-        "model": LLM_MODEL,
-        "temperature": 0,
-        "max_tokens": 600,
+        "model": model, "temperature": 0, "max_tokens": 400,
         "response_format": {"type": "json_object"},
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
     }
-    try:
-        req = urlrequest.Request(
-            LLM_BASE + "/chat/completions",
-            data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {LLM_API_KEY}"},
-        )
-        with urlrequest.urlopen(req, timeout=timeout) as r:
-            data = json.loads(r.read().decode())
-        text = data["choices"][0]["message"]["content"]
-        text = re.sub(r"^```(json)?|```$", "", text.strip()).strip()
-        return json.loads(text)
-    except Exception as e:  # noqa
-        print("LLM error:", repr(e)[:300])
+    req = urlrequest.Request(
+        LLM_BASE + "/chat/completions", data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {LLM_API_KEY}",
+                 "User-Agent": "vera-bot/1.1"},
+    )
+    with urlrequest.urlopen(req, timeout=timeout) as r:
+        data = json.loads(r.read().decode())
+    text = data["choices"][0]["message"]["content"]
+    text = re.sub(r"^```(json)?|```$", "", text.strip()).strip()
+    return json.loads(text)
+
+
+def llm_json(system: str, user: str, timeout: float = 18.0):
+    """OpenAI-compatible call with bounded concurrency, one 429 back-off, and a backup model."""
+    if not LLM_API_KEY:
         return None
+    deadline = time.time() + timeout
+    models = [LLM_MODEL] + ([LLM_MODEL_2] if LLM_MODEL_2 and LLM_MODEL_2 != LLM_MODEL else [])
+    got = LLM_SLOTS.acquire(timeout=max(1, timeout - 6))
+    if not got:
+        return None
+    try:
+        for model in models:
+            for attempt in range(2):
+                left = deadline - time.time()
+                if left < 3:
+                    return None
+                try:
+                    out = _chat(model, system, user, min(left, 15))
+                    LLM_STATS["ok"] += 1
+                    return out
+                except HTTPError as e:
+                    detail = ""
+                    try:
+                        detail = e.read().decode()[:200]
+                    except Exception:
+                        pass
+                    LLM_STATS["fail"] += 1
+                    LLM_STATS["last_error"] = f"{e.code} {model}: {detail}"
+                    print(f"LLM error {e.code} on {model}: {detail}")
+                    if e.code == 429 and attempt == 0:
+                        wait = 2.0
+                        try:
+                            wait = min(float(e.headers.get("retry-after", 2)), 5)
+                        except Exception:
+                            pass
+                        if deadline - time.time() > wait + 3:
+                            time.sleep(wait)
+                            continue
+                    break  # other errors or second 429 -> next model
+                except Exception as e:  # timeout, bad JSON
+                    LLM_STATS["fail"] += 1
+                    LLM_STATS["last_error"] = f"{model}: {repr(e)[:150]}"
+                    print("LLM error:", repr(e)[:200])
+                    break
+        return None
+    finally:
+        LLM_SLOTS.release()
 
 
 # ----------------------------------------------------------------------------- state
@@ -113,12 +160,26 @@ def pct(x):
         return str(x)
 
 
+def _is_pct(title):
+    return bool(re.search(r"\d+\s*%", str(title)))
+
+
 def active_offer(merchant, category):
-    for o in merchant.get("offers") or []:
-        if o.get("status") == "active":
-            return o.get("title")
-    cat = (category or {}).get("offer_catalog") or []
-    return cat[0]["title"] if cat else None
+    """Prefer service@price offers; '% off' copy is penalised by the rubric."""
+    act = [o.get("title") for o in (merchant.get("offers") or []) if o.get("status") == "active"]
+    cat = [o.get("title") for o in ((category or {}).get("offer_catalog") or [])]
+    for t in act + cat:
+        if t and not _is_pct(t):
+            return t
+    return act[0] if act else (cat[0] if cat else None)
+
+
+def nice_date(iso):
+    try:
+        d = datetime.fromisoformat(str(iso)[:10])
+        return d.strftime("%-d %b")
+    except Exception:
+        return str(iso)
 
 
 # ----------------------------------------------------------------------------- COMPOSER
@@ -138,34 +199,46 @@ HARD RULES
 Return JSON only: {"body": "...", "cta": "binary_yes_stop" | "open_ended" | "slot_choice" | "none", "rationale": "1-2 sentences: which trigger fact + which merchant fact + which lever"}"""
 
 
+def _j(x):
+    return json.dumps(x, ensure_ascii=False, separators=(",", ":"))
+
+
 def build_prompt(category, merchant, trigger, customer):
     payload = trigger.get("payload") or {}
     item_id = payload.get("top_item_id") or payload.get("digest_item_id") or payload.get("alert_id")
+    voice = category.get("voice") or {}
     cat_view = {
         "slug": category.get("slug"),
-        "voice": category.get("voice"),
-        "offer_catalog": category.get("offer_catalog"),
+        "tone": voice.get("tone"), "taboo_words": voice.get("vocab_taboo"),
+        "allowed_vocab": (voice.get("vocab_allowed") or [])[:10],
+        "offer_catalog": [o.get("title") for o in (category.get("offer_catalog") or [])][:6],
         "peer_stats": category.get("peer_stats"),
         "referenced_digest_item": find_digest(category, item_id) if item_id else None,
-        "digest_other": [d for d in (category.get("digest") or []) if d.get("id") != item_id][:3],
-        "seasonal_beats": category.get("seasonal_beats"),
-        "trend_signals": category.get("trend_signals"),
-        "patient_content_library": [{"id": c.get("id"), "title": c.get("title")} for c in (category.get("patient_content_library") or [])][:4],
+        "seasonal_beats": (category.get("seasonal_beats") or [])[:2],
+        "trend_signals": (category.get("trend_signals") or [])[:2],
     }
-    m_view = dict(merchant)
-    m_view["conversation_history"] = (merchant.get("conversation_history") or [])[-4:]
+    ident = merchant.get("identity") or {}
+    m_view = {
+        "name": ident.get("name"), "owner_first_name": ident.get("owner_first_name"),
+        "locality": ident.get("locality"), "city": ident.get("city"), "verified": ident.get("verified"),
+        "subscription": merchant.get("subscription"), "performance": merchant.get("performance"),
+        "offers": [f"{o.get('title')} ({o.get('status')})" for o in (merchant.get("offers") or [])],
+        "customer_aggregate": merchant.get("customer_aggregate"), "signals": merchant.get("signals"),
+        "review_themes": merchant.get("review_themes"),
+        "recent_conversation": [f"{t.get('from')}: {t.get('body')}" for t in (merchant.get("conversation_history") or [])[-2:]],
+    }
     send_as = "merchant_on_behalf" if (trigger.get("scope") == "customer" and customer) else "vera"
     lang = "Hinglish (Hindi-English code-mix, Roman script)" if wants_hinglish(merchant, customer) else "English"
-    who = (f"Address the customer {customer.get('identity', {}).get('name')} as the business '{merchant.get('identity', {}).get('name')}'."
+    who = (f"Address the customer {customer.get('identity', {}).get('name')} as the business '{ident.get('name')}'."
            if send_as == "merchant_on_behalf" else f"Address the merchant as '{salutation(category, merchant)}'.")
-    user = (
-        f"send_as: {send_as}\nLANGUAGE: {lang}\n{who}\n\n"
-        f"TRIGGER (why now):\n{json.dumps(trigger, ensure_ascii=False)}\n\n"
-        f"MERCHANT:\n{json.dumps(m_view, ensure_ascii=False)}\n\n"
-        f"CATEGORY:\n{json.dumps(cat_view, ensure_ascii=False)}\n\n"
-        + (f"CUSTOMER:\n{json.dumps(customer, ensure_ascii=False)}\n\n" if customer else "")
-        + "Write the message now."
-    )
+    c_view = None
+    if customer:
+        c_view = {k: customer.get(k) for k in ("identity", "relationship", "state", "preferences", "consent")}
+        (c_view.get("identity") or {}).pop("phone_redacted", None)
+    user = (f"send_as: {send_as}\nLANGUAGE: {lang}\n{who}\n"
+            f"TRIGGER: {_j({k: trigger.get(k) for k in ('kind', 'scope', 'source', 'payload', 'urgency', 'expires_at')})}\n"
+            f"MERCHANT: {_j(m_view)}\nCATEGORY: {_j(cat_view)}\n"
+            + (f"CUSTOMER: {_j(c_view)}\n" if c_view else "") + "Write the message now.")
     return send_as, user
 
 
@@ -182,13 +255,13 @@ def validate(out, category):
     return True
 
 
-def compose(category: dict, merchant: dict, trigger: dict, customer: dict | None = None) -> dict:
+def compose(category: dict, merchant: dict, trigger: dict, customer: dict | None = None, llm_timeout: float = 18.0) -> dict:
     """Public contract from the brief: returns body, cta, send_as, suppression_key, rationale."""
     category = category or {}
     send_as, user = build_prompt(category, merchant, trigger, customer)
-    out = llm_json(SYSTEM_COMPOSE, user)
+    out = llm_json(SYSTEM_COMPOSE, user, timeout=llm_timeout)
     if not validate(out, category):
-        out2 = llm_json(SYSTEM_COMPOSE, user + "\n\nYour previous draft broke a rule (taboo word, % off, or empty). Rewrite strictly.") if out else None
+        out2 = llm_json(SYSTEM_COMPOSE, user + "\n\nYour previous draft broke a rule (taboo word, % off, or empty). Rewrite strictly.", timeout=llm_timeout) if out else None
         out = out2 if validate(out2, category) else None
     if out is None:
         out = fallback_compose(category, merchant, trigger, customer)
@@ -224,18 +297,23 @@ def fallback_compose(category, merchant, trigger, customer):
         last = (customer.get("relationship") or {}).get("last_visit")
         if kind == "chronic_refill_due" and p.get("molecule_list"):
             meds = ", ".join(p.get("molecule_list") or [])
-            body = (f"Namaste {cname}, {biz} se. Aapki {meds} ki supply {str(p.get('stock_runs_out_iso',''))[:10]} tak khatam ho rahi hai. "
+            body = (f"Namaste {cname}, {biz} se. Aapki {meds} ki supply {nice_date(p.get('stock_runs_out_iso',''))} tak khatam ho rahi hai. "
                     f"Same order saved address pe bhej dein? Reply YES." if hi else
-                    f"Hi {cname}, {biz} here. Your {meds} supply runs out around {str(p.get('stock_runs_out_iso',''))[:10]}. "
+                    f"Hi {cname}, {biz} here. Your {meds} supply runs out around {nice_date(p.get('stock_runs_out_iso',''))}. "
                     f"Shall we deliver the same order to your saved address? Reply YES.")
             return {"body": body, "cta": "binary_yes_stop", "rationale": "Refill due date from trigger; one-tap reorder."}
         base = (f"Hi {cname}, {biz} se 🙂 " if hi else f"Hi {cname}, {biz} here 🙂 ")
         if last:
-            base += (f"Aapki last visit {last} ko thi. " if hi else f"Your last visit was on {last}. ")
+            base += (f"Aapki last visit {nice_date(last)} ko thi. " if hi else f"Your last visit was on {nice_date(last)}. ")
         if kind in ("recall_due",):
             base += ("Aapki next visit ab due hai. " if hi else "Your next visit is now due. ")
         elif kind == "appointment_tomorrow":
             base += ("Kal aapka appointment hai, bas confirm kar rahe hain. " if hi else "Just confirming your appointment tomorrow. ")
+        elif kind == "chronic_refill_due" and (category or {}).get("slug") == "pharmacies":
+            base += ("Aapki regular dawaiyon ka refill time aa gaya hai. " if hi else "It's time for your regular medicine refill. ")
+            offer = None
+        elif kind == "chronic_refill_due":
+            base += ("Aapka routine check-in due hai. " if hi else "You're due for a routine check-in. ")
         elif kind in ("customer_lapsed_soft", "customer_lapsed_hard", "winback_eligible"):
             base += ("Kaafi time ho gaya, hum aapko miss kar rahe hain. " if hi else "It's been a while, and we'd love to see you again. ")
         elif kind == "trial_followup":
@@ -246,7 +324,10 @@ def fallback_compose(category, merchant, trigger, customer):
             base += (f"Slots: {slot_txt}. Reply 1 ya 2, ya apna time batayein." if hi else f"Open slots: {slot_txt}. Reply 1 or 2, or tell us a time that suits you.")
             cta = "slot_choice"
         else:
-            base += ("Book karna ho toh reply YES." if hi else "Reply YES and we'll book you in.")
+            if (category or {}).get("slug") == "pharmacies":
+                base += ("Order ready karein? Reply YES." if hi else "Shall we keep your order ready? Reply YES.")
+            else:
+                base += ("Book karna ho toh reply YES." if hi else "Reply YES and we'll book you in.")
             cta = "binary_yes_stop"
         return {"body": base, "cta": cta, "rationale": f"Customer-facing {kind}: uses customer history + merchant's real offer/slots."}
 
@@ -317,14 +398,53 @@ def fallback_compose(category, merchant, trigger, customer):
         body = (f"{name}, aapka Google profile abhi unverified hai. Verify hone pe typically ~{pct(p.get('estimated_uplift_pct'))} zyada visibility milti hai. Process ({str(p.get('verification_path','')).replace('_',' ')}) main step-by-step karwa doon? Reply YES." if hi else
                 f"{name}, your Google profile is still unverified. Verification typically adds ~{pct(p.get('estimated_uplift_pct'))} visibility. Want me to walk you through it ({str(p.get('verification_path','')).replace('_',' ')})? Reply YES.")
         return {"body": body, "cta": "binary_yes_stop", "rationale": "Unverified status + uplift estimate from trigger."}
-    # generic but still data-anchored
+    # generic but still data-anchored, phrased per trigger kind
     comp = ""
     if ctr and peer_ctr:
-        comp = (f" Aapka CTR {ctr*100:.1f}% hai vs peer avg {peer_ctr*100:.1f}%." if hi else f" Your CTR is {ctr*100:.1f}% vs a peer average of {peer_ctr*100:.1f}%.")
-    topic = str(p.get("intent_topic") or p.get("season") or p.get("match") or trigger.get("kind", "")).replace("_", " ")
-    body = (f"{name}, '{topic}' ke liye maine ek ready plan draft kiya hai.{comp} {offer + ' ko lead offer rakhte hain. ' if offer else ''}Bhej doon? Reply YES." if hi else
-            f"{name}, I've put together a ready plan for '{topic}'.{comp} {'Leading with ' + offer + '. ' if offer else ''}Want me to send it over? Reply YES.")
-    return {"body": body, "cta": "binary_yes_stop", "rationale": f"{kind}: trigger topic + merchant metrics, effort externalised."}
+        if abs(ctr - peer_ctr) < 0.0005:
+            comp = (f" Aapka CTR {ctr*100:.1f}% hai, bilkul peer average jitna." if hi else f" Your CTR is {ctr*100:.1f}%, right at the peer average.")
+        else:
+            gap = "neeche" if ctr < peer_ctr else "upar"
+            comp = (f" Aapka CTR {ctr*100:.1f}% hai, peer average {peer_ctr*100:.1f}% se {gap}." if hi else
+                    f" Your CTR is {ctr*100:.1f}% against a peer average of {peer_ctr*100:.1f}%.")
+    views = perf.get("views")
+    k = trigger.get("kind", "")
+    lead = offer or "your top service"
+    if k == "competitor_opened":
+        opener = (f"{name}, {loc} mein ek naya competitor listing live hua hai." if hi else f"{name}, a new competitor listing just went live near {loc}.")
+        ask = (f"{lead} ko top pe rakh ke ek fresh post daal doon? Reply YES." if hi else f"Want me to put {lead} front and centre with a fresh post today? Reply YES.")
+    elif k == "dormant_with_vera":
+        opener = (f"{name}, kaafi din se baat nahi hui. Is beech aapki listing pe {views} views aaye (30 din)." if hi else f"{name}, it's been a while. Your listing still pulled {views} views in the last 30 days.")
+        ask = ("2-minute ka profile check kar doon? Reply YES." if hi else "Want a 2-minute profile check? Reply YES.")
+    elif k == "festival_upcoming":
+        opener = (f"{name}, festive season shuru ho raha hai aur searches badhne wali hain." if hi else f"{name}, festive-season searches are about to climb.")
+        ask = (f"{lead} pe ek festive post draft kar diya hai. Schedule kar doon? Reply YES." if hi else f"I've drafted a festive post around {lead}. Schedule it? Reply YES.")
+    elif k == "milestone_reached":
+        opener = (f"{name}, aap ek naye milestone ke kareeb ho!" if hi else f"{name}, you're close to a new milestone!")
+        ask = ("Recent happy customers ko review request bhej doon? Reply YES." if hi else "Shall I send a review request to your recent happy customers? Reply YES.")
+    elif k in ("perf_dip", "seasonal_perf_dip"):
+        opener = (f"{name}, is hafte listing performance thoda slow hai." if hi else f"{name}, your listing has slowed down this week.")
+        ask = (f"{lead} ke saath ek Google post ready hai. Publish kar doon? Reply YES." if hi else f"I've got a Google post featuring {lead} ready. Publish it? Reply YES.")
+    elif k == "perf_spike":
+        opener = (f"{name}, good news: is hafte aapki listing pe traffic badha hai." if hi else f"{name}, good news: traffic to your listing picked up this week.")
+        ask = ("Isi momentum pe ek follow-up post daal doon? Reply YES." if hi else "Want to ride the momentum with a follow-up post? Reply YES.")
+    elif k == "ipl_match_today":
+        opener = (f"{name}, aaj {p.get('match','match')} hai ({p.get('city','')}), shaam ko orders aur footfall badhenge." if hi else f"{name}, {p.get('match','the match')} is on tonight in {p.get('city','your city')}, so evening demand will spike.")
+        ask = (f"{lead} pe ek match-night post abhi live kar doon? Reply YES." if hi else f"Shall I push a match-night post featuring {lead} now? Reply YES.")
+    elif k == "category_seasonal":
+        trends = ", ".join(str(t).replace("_", " ") for t in (p.get("trends") or [])[:3])
+        opener = (f"{name}, is season ke demand trends: {trends}." if hi else f"{name}, this season's demand shifts: {trends}.")
+        ask = ("In items ko highlight karke ek post + shelf checklist bhej doon? Reply YES." if hi else "Want a post highlighting these plus a quick shelf checklist? Reply YES.")
+    elif k == "active_planning_intent":
+        topic = str(p.get("intent_topic", "")).replace("_", " ")
+        opener = (f"{name}, aapne '{topic}' ke liye haan bola tha, toh maine ek draft bana liya hai." if hi else f"{name}, you said yes to the {topic} idea, so I've drafted it.")
+        ask = (f"{lead} ko anchor rakha hai. Bhej doon? Reply YES." if hi else f"It's anchored on {lead}. Shall I send it over? Reply YES.")
+    else:
+        topic = str(p.get("intent_topic") or p.get("season") or k).replace("_", " ")
+        opener = (f"{name}, '{topic}' ke liye ek ready plan hai." if hi else f"{name}, I have a ready plan for {topic}.")
+        ask = (f"{lead} ko lead offer rakhte hain. Bhej doon? Reply YES." if hi else f"Leading with {lead}. Send it over? Reply YES.")
+    body = f"{opener}{comp} {ask}"
+    return {"body": body, "cta": "binary_yes_stop", "rationale": f"{k}: trigger event + merchant metrics vs peers, single low-effort CTA (template composer)."}
 
 
 # ----------------------------------------------------------------------------- REPLY ROUTER
@@ -456,9 +576,9 @@ def respond(conv: dict, message: str) -> dict:
 
 
 # ----------------------------------------------------------------------------- ENDPOINTS
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"service": "Vera 2.0 — magicpin AI challenge bot", "endpoints": ["/v1/healthz", "/v1/metadata", "/v1/context", "/v1/tick", "/v1/reply"]}
+    return HTMLResponse(render_landing())
 
 
 @app.get("/v1/healthz")
@@ -466,18 +586,19 @@ async def healthz():
     counts = {"category": 0, "merchant": 0, "customer": 0, "trigger": 0}
     for (scope, _) in contexts:
         counts[scope] = counts.get(scope, 0) + 1
-    return {"status": "ok", "uptime_seconds": int(time.time() - START), "contexts_loaded": counts}
+    return {"status": "ok", "uptime_seconds": int(time.time() - START), "contexts_loaded": counts,
+            "llm": {"model": LLM_MODEL if LLM_API_KEY else None, "calls_ok": LLM_STATS["ok"], "calls_failed": LLM_STATS["fail"]}}
 
 
 @app.get("/v1/metadata")
 async def metadata():
     return {
-        "team_name": os.environ.get("TEAM_NAME", "Vera 2.0"),
-        "team_members": [m.strip() for m in os.environ.get("TEAM_MEMBERS", "Candidate").split(",")],
+        "team_name": os.environ.get("TEAM_NAME", "Aryan Maheshwari — Vera 2.0"),
+        "team_members": [m.strip() for m in os.environ.get("TEAM_MEMBERS", "Aryan Maheshwari").split(",")],
         "model": LLM_MODEL if LLM_API_KEY else "template-fallback",
         "approach": "Trigger-routed LLM composer over 4 contexts with fact-grounding + taboo/format validation and deterministic template fallback; rule-based reply router (auto-reply, opt-out, hostile, off-topic, commit->action mode) + LLM for open replies.",
         "contact_email": os.environ.get("CONTACT_EMAIL", "candidate@example.com"),
-        "version": "1.0.0",
+        "version": "1.1.0",
         "submitted_at": "2026-09-26T00:00:00Z",
     }
 
@@ -631,6 +752,104 @@ async def teardown():
     return {"ok": True}
 
 
+
+# ----------------------------------------------------------------------------- landing page (for humans)
+import html as _html
+
+EXAMPLE_IDS = [("T30", "Dentist · regulation change"), ("T09", "Dentist · competitor opened"), ("T28", "Patient recall · sent as the clinic")]
+
+
+def _examples():
+    rows = {r["test_id"]: r for r in build_submission()}
+    try:
+        cats, ms, cs, ts, pairs = load_local_dataset()
+        names = {p["test_id"]: ms[p["merchant_id"]]["identity"]["name"] for p in pairs}
+    except Exception:
+        names = {}
+    out = []
+    for tid, label in EXAMPLE_IDS:
+        r = rows.get(tid)
+        if r:
+            out.append((names.get(tid, ""), label, r["body"], r["rationale"]))
+    return out
+
+
+def render_landing():
+    e = _html.escape
+    bubbles = "".join(
+        f'<figure class="msg"><figcaption><strong>{e(n)}</strong><span>{e(l)}</span></figcaption>'
+        f'<p class="bubble">{e(b)}</p><p class="why">Why: {e(w)}</p></figure>' for n, l, b, w in _examples())
+    llm = f"{e(LLM_MODEL)}" if LLM_API_KEY else "template composer"
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Vera 2.0 — merchant WhatsApp assistant</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💬</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Hind:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{{--ink:#17202c;--muted:#5d6878;--bg:#f2f4f7;--line:#d9dee6;--wall:#e9e1d6;--out:#d9fdd3;--violet:#4a2fb0;}}
+*{{box-sizing:border-box}}html,body{{margin:0}}
+body{{background:var(--bg);color:var(--ink);font:17px/1.6 Hind,"Segoe UI",system-ui,sans-serif;
+padding:env(safe-area-inset-top,0) 0 env(safe-area-inset-bottom,0)}}
+a{{color:var(--violet)}}a:focus-visible{{outline:3px solid var(--violet);outline-offset:2px}}
+.wrap{{max-width:1080px;margin:0 auto;padding:48px 24px 72px}}
+.hero{{display:grid;grid-template-columns:1fr 1.05fr;gap:48px;align-items:start}}
+h1{{font-size:clamp(2rem,4.2vw,3.1rem);line-height:1.08;font-weight:700;margin:0 0 20px;letter-spacing:-.01em}}
+.lede{{font-size:1.12rem;color:var(--muted);max-width:34em;margin:0 0 24px}}
+.live{{display:inline-flex;gap:10px;align-items:center;font-weight:500;background:#fff;border:1px solid var(--line);padding:8px 14px;border-radius:999px}}
+.dot{{width:9px;height:9px;border-radius:50%;background:#1f9d55}}
+.chat{{background:var(--wall);border-radius:22px;padding:22px 18px;border:1px solid #ddd2c4}}
+.msg{{margin:0 0 18px}}.msg:last-child{{margin:0}}
+figcaption{{font-size:.84rem;color:#6b5f52;margin:0 0 4px 4px;display:flex;gap:8px;flex-wrap:wrap}}
+figcaption strong{{color:#3d342b}}
+.bubble{{background:var(--out);margin:0;padding:10px 14px;border-radius:14px 14px 4px 14px;box-shadow:0 1px 0 rgba(0,0,0,.08);font-size:.98rem;line-height:1.5}}
+.why{{font-size:.78rem;color:#7a6e61;margin:6px 4px 0}}
+@media (prefers-reduced-motion:no-preference){{.msg{{animation:in .5s ease both}}.msg:nth-child(2){{animation-delay:.35s}}.msg:nth-child(3){{animation-delay:.7s}}
+@keyframes in{{from{{opacity:0;transform:translateY(8px)}}to{{opacity:1;transform:none}}}}}}
+h2{{font-size:1.5rem;margin:64px 0 16px;font-weight:600}}
+.table{{overflow-x:auto}}table{{border-collapse:collapse;width:100%;background:#fff;border:1px solid var(--line);border-radius:12px;overflow:hidden}}
+td,th{{text-align:left;padding:12px 16px;border-bottom:1px solid var(--line);vertical-align:top}}th{{font-weight:600;background:#f8f9fb}}
+tr:last-child td{{border-bottom:0}}td:first-child{{font-style:italic;color:var(--muted);width:34%}}
+ol{{padding-left:1.3em;max-width:44em}}ol li{{margin:0 0 10px}}
+code{{background:#fff;border:1px solid var(--line);padding:1px 6px;border-radius:6px;font-size:.88em}}
+.ep{{display:flex;flex-wrap:wrap;gap:10px}}.ep a{{background:#fff;border:1px solid var(--line);padding:8px 14px;border-radius:10px;text-decoration:none}}
+footer{{margin-top:56px;color:var(--muted);font-size:.9rem}}
+@media (max-width:820px){{.hero{{grid-template-columns:1fr}}.wrap{{padding-top:28px}}}}
+</style></head><body><main class="wrap">
+<section class="hero"><div>
+<h1>The one WhatsApp a busy merchant actually replies to.</h1>
+<p class="lede">Vera 2.0 is my rebuild of magicpin's merchant assistant for the AI Challenge. It reads four layers of context
+(category, merchant, trigger, customer), decides whether a message is worth sending, writes it in the merchant's own language
+with their real numbers, and handles the reply, including auto-replies, a sudden "let's do it", and a hard no.</p>
+<span class="live"><span class="dot" aria-hidden="true"></span>Live · composing with {llm}</span>
+</div>
+<div class="chat" aria-label="Messages composed by this bot from the challenge dataset">{bubbles}</div></section>
+
+<h2>When the merchant replies</h2>
+<div class="table"><table><tr><th>Merchant says</th><th>What Vera 2.0 does</th></tr>
+<tr><td>"Thank you for contacting us, we'll get back to you" (again)</td><td>Spots the canned auto-reply, sends one short note for the owner, backs off 24h, then exits. No wasted turns.</td></tr>
+<tr><td>"Ok, let's do it" / "haan karo"</td><td>Switches straight to action and confirms what it's doing. No more qualifying questions.</td></tr>
+<tr><td>Abuse, then "can you file my GST?"</td><td>De-escalates once, offers to stop, declines the off-topic ask and steers back to the listing.</td></tr>
+<tr><td>"Not interested, stop"</td><td>Ends the conversation and never messages on that thread again.</td></tr>
+<tr><td>A real question, in Hindi after starting in English</td><td>Answers from the data it has, in the language used in that turn, then moves one step forward.</td></tr>
+</table></div>
+
+<h2>How a message gets written</h2>
+<ol>
+<li>A trigger arrives (research digest, dip in calls, Diwali, a patient's recall window). Expired or already-sent triggers are dropped.</li>
+<li>Only the context that matters is pulled: the cited digest item, peer benchmarks, the active service@price offer, last conversation turns.</li>
+<li>An LLM writes the message at temperature 0 under hard rules: lead with why-now, use only facts present, category voice, one CTA.</li>
+<li>A validator rejects taboo words ("guaranteed", "cure") and "% off" framing, and re-prompts once.</li>
+<li>If the model is slow or unavailable, a deterministic, fact-anchored template takes over, so the bot never times out or sends an empty message.</li>
+</ol>
+
+<h2>Endpoints</h2>
+<p>This service is scored by magicpin's judge harness over HTTP. Useful read-only links:</p>
+<div class="ep"><a href="/v1/healthz">/v1/healthz</a><a href="/v1/metadata">/v1/metadata</a><a href="/v1/status">/v1/status</a><a href="/v1/submission">/v1/submission</a><a href="https://github.com/Hellster666/vera-bot">Source on GitHub</a></div>
+<p>Judge-facing: <code>POST /v1/context</code> <code>POST /v1/tick</code> <code>POST /v1/reply</code></p>
+<footer>Built by Aryan Maheshwari for the magicpin Tech / Product AI Analyst challenge. Synthetic dataset; no real merchant data.</footer>
+</main></body></html>"""
+
 # ----------------------------------------------------------------------------- submission generator
 def load_local_dataset():
     x = json.load(open(os.path.join(BASE_DIR, "dataset.json"), encoding="utf-8"))
@@ -640,25 +859,65 @@ def load_local_dataset():
     return x["categories"], ms, cs, ts, x["pairs"]
 
 
-def build_submission():
-    cats, ms, cs, ts, pairs = load_local_dataset()
+SUB_ROWS: dict = {}
+SUB_STATE = {"running": False, "started": None, "finished": None}
 
-    def one(p):
+
+def _submission_worker():
+    """Builds the 30 canonical messages slowly in the background so free-tier LLM rate limits aren't hit."""
+    if SUB_STATE["running"]:
+        return
+    SUB_STATE.update(running=True, started=now_iso(), finished=None)
+    try:
+        cats, ms, cs, ts, pairs = load_local_dataset()
+        for p in pairs:
+            m = ms[p["merchant_id"]]; t = ts[p["trigger_id"]]
+            c = cs.get(p.get("customer_id")) if p.get("customer_id") else None
+            SUB_ROWS[p["test_id"]] = {"test_id": p["test_id"], **compose(cats.get(m["category_slug"], {}), m, t, c, llm_timeout=45)}
+            time.sleep(float(os.environ.get("SUBMISSION_PACE_S", "8")))
+    finally:
+        SUB_STATE.update(running=False, finished=now_iso())
+
+
+def build_submission():
+    """Rows from the background run where available; deterministic template for any not yet composed."""
+    cats, ms, cs, ts, pairs = load_local_dataset()
+    rows = []
+    for p in pairs:
+        if p["test_id"] in SUB_ROWS:
+            rows.append(SUB_ROWS[p["test_id"]]); continue
         m = ms[p["merchant_id"]]; t = ts[p["trigger_id"]]
         c = cs.get(p.get("customer_id")) if p.get("customer_id") else None
-        out = compose(cats.get(m["category_slug"], {}), m, t, c)
-        return {"test_id": p["test_id"], **out}
-
-    rows = list(pool.map(one, pairs))
-    rows.sort(key=lambda r: r["test_id"])
+        cat = cats.get(m["category_slug"], {})
+        fb = fallback_compose(cat, m, t, c)
+        rows.append({"test_id": p["test_id"], "body": fb["body"], "cta": fb["cta"],
+                     "send_as": "merchant_on_behalf" if (t.get("scope") == "customer" and c) else "vera",
+                     "suppression_key": t.get("suppression_key"), "rationale": fb["rationale"]})
     return rows
 
 
-@app.get("/v1/submission")
-async def submission():
+@app.on_event("startup")
+def _kickoff():
+    if LLM_API_KEY:
+        threading.Thread(target=_submission_worker, daemon=True).start()
+
+
+@app.api_route("/v1/submission", methods=["GET", "HEAD"])
+def submission(refresh: int = 0):
+    """submission.jsonl for the 30 canonical pairs. Background-composed by the LLM at startup; ?refresh=1 re-runs."""
+    if refresh and LLM_API_KEY and not SUB_STATE["running"]:
+        SUB_ROWS.clear()
+        threading.Thread(target=_submission_worker, daemon=True).start()
     rows = build_submission()
     return PlainTextResponse("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n",
-                             headers={"Content-Disposition": "attachment; filename=submission.jsonl"})
+                             media_type="text/plain; charset=utf-8",
+                             headers={"X-Composed-By-LLM": str(len(SUB_ROWS)), "X-Worker-Running": str(SUB_STATE["running"])})
+
+
+@app.get("/v1/status")
+async def status():
+    return {"llm_model": LLM_MODEL if LLM_API_KEY else None, "llm_calls_ok": LLM_STATS["ok"], "llm_calls_failed": LLM_STATS["fail"],
+            "last_llm_error": LLM_STATS["last_error"], "submission_rows_composed": len(SUB_ROWS), "submission_worker": SUB_STATE}
 
 
 if __name__ == "__main__":
